@@ -25,8 +25,11 @@ type PodMeta struct {
 
 var idRegex = regexp.MustCompile(`[0-9a-f]{32,64}`)
 
-// LookupContainerMetadata parses /proc/<pid>/cgroup for container IDs.
-func LookupContainerMetadata(pid int, cgroupID uint64) ContainerMeta {
+// LookupContainerMetadata reads /proc/<pid>/cgroup and takes the first long hex string in it
+// as the container ID, which is where Docker and containerd put one. A process that has
+// already exited, or that is not in a container, comes back as "host". This is a guess from
+// the cgroup path, not a query to a container runtime.
+func LookupContainerMetadata(pid int) ContainerMeta {
 	path := filepath.Join("/proc", strconv.Itoa(pid), "cgroup")
 	f, err := os.Open(path)
 	if err != nil {
@@ -41,14 +44,12 @@ func LookupContainerMetadata(pid int, cgroupID uint64) ContainerMeta {
 			return ContainerMeta{ID: m, Name: m[:12], Runtime: "cgroup"}
 		}
 	}
-	if err := scanner.Err(); err != nil {
-		return ContainerMeta{ID: "error", Name: "error", Runtime: "cgroup"}
-	}
-
-	return ContainerMeta{ID: "cgid", Name: "cgid", Runtime: "cgroup"}
+	return ContainerMeta{ID: "host", Name: "", Runtime: ""}
 }
 
-// LookupPodMeta derives pod info from env or hostname for demo purposes.
+// LookupPodMeta returns the pod the AGENT runs in, from the environment variables the Helm
+// chart sets (or the hostname). It is the same for every event: the agent does not ask the
+// Kubernetes API which pod an event's process belongs to.
 func LookupPodMeta() PodMeta {
 	ns := getenv("POD_NAMESPACE", "default")
 	name := getenv("POD_NAME", hostnameFallback())

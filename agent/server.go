@@ -11,15 +11,21 @@ import (
 // AlertServer provides an SSE endpoint for live alerts.
 type AlertServer struct {
 	addr        string
+	corsOrigin  string
 	logger      *log.Logger
 	subscribers map[chan Alert]struct{}
 	mu          sync.Mutex
 }
 
-// NewAlertServer constructs a server bound to addr.
-func NewAlertServer(addr string, logger *log.Logger) *AlertServer {
+// NewAlertServer constructs a server bound to addr. corsOrigin is the one browser origin
+// allowed to read /events (the dashboard's); an empty string sends no CORS header.
+//
+// The endpoints have no authentication. Bind to a loopback address unless the network is
+// trusted.
+func NewAlertServer(addr, corsOrigin string, logger *log.Logger) *AlertServer {
 	return &AlertServer{
 		addr:        addr,
+		corsOrigin:  corsOrigin,
 		logger:      logger,
 		subscribers: make(map[chan Alert]struct{}),
 	}
@@ -43,10 +49,18 @@ func (s *AlertServer) ListenAndServe(ctx context.Context, alerts <-chan Alert) e
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.Header().Set("Cache-Control", "no-cache")
 		w.Header().Set("Connection", "keep-alive")
+		if s.corsOrigin != "" {
+			w.Header().Set("Access-Control-Allow-Origin", s.corsOrigin)
+		}
 
+		// Subscribe before the headers go out, so a client that has seen the response
+		// start is already receiving alerts.
 		client := make(chan Alert, 32)
 		s.addSubscriber(client)
 		defer s.removeSubscriber(client)
+
+		w.WriteHeader(http.StatusOK)
+		flusher.Flush()
 
 		notify := r.Context().Done()
 		for {

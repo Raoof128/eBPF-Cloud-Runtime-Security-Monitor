@@ -1,3 +1,4 @@
+# Placeholders. No image is published for this project and the repository has no Dockerfile.
 image:
   agent: ghcr.io/example/runtime-agent:latest
   dashboard: ghcr.io/example/runtime-dashboard:latest
@@ -22,5 +23,6 @@ service:
   type: ClusterIP
   port: 8080
 
-rbac:
+# The agent does not call the Kubernetes API, so the account gets no role and no token.
+serviceAccount:
   create: true
