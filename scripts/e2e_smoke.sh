@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# End-to-end check on a real kernel: build the probes and the agent, attach the probes, make
+# End-to-end check on a real kernel: build the probe and the agent, attach the probe, make
 # a handful of harmless syscalls, and expect the matching alerts in the agent's output.
 #
 # Needs Linux, root (through sudo unless already root), clang, the libbpf headers, Go and

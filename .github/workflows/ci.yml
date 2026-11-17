@@ -47,8 +47,8 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y clang libbpf-dev
-      # Compiles the eBPF object, loads the six programs into the runner's kernel, attaches
-      # them, makes a handful of harmless syscalls and fails unless the matching alerts come
+      # Compiles the eBPF object, loads it into the runner's kernel, attaches
+      # it, makes a handful of harmless syscalls and fails unless the matching alerts come
       # out of the agent.
       - name: Smoke test
         run: make e2e

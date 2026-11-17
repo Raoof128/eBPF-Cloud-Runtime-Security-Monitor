@@ -20,16 +20,9 @@ import (
 	"github.com/cilium/ebpf/rlimit"
 )
 
-// tracepoints maps each program in ebpf/process_monitor.c to the syscall tracepoint it
-// attaches to.
-var tracepoints = map[string]string{
-	"handle_execve":   "sys_enter_execve",
-	"handle_execveat": "sys_enter_execveat",
-	"handle_connect":  "sys_enter_connect",
-	"handle_ptrace":   "sys_enter_ptrace",
-	"handle_memfd":    "sys_enter_memfd_create",
-	"handle_mmap":     "sys_enter_mmap",
-}
+// programName is the one program in ebpf/process_monitor.c. It attaches to the raw sys_enter
+// tracepoint and picks out the six syscalls itself.
+const programName = "handle_sys_enter"
 
 func main() {
 	logger := log.New(os.Stdout, "agent ", log.LstdFlags|log.LUTC)
@@ -58,17 +51,15 @@ func main() {
 	}
 	defer coll.Close()
 
-	for progName, tracepoint := range tracepoints {
-		prog := coll.Programs[progName]
-		if prog == nil {
-			logger.Fatalf("program %s is missing from %s", progName, objectPath)
-		}
-		attached, err := link.Tracepoint("syscalls", tracepoint, prog, nil)
-		if err != nil {
-			logger.Fatalf("attach %s to syscalls:%s: %v", progName, tracepoint, err)
-		}
-		defer attached.Close()
+	prog := coll.Programs[programName]
+	if prog == nil {
+		logger.Fatalf("program %s is missing from %s", programName, objectPath)
 	}
+	attached, err := link.AttachRawTracepoint(link.RawTracepointOptions{Name: "sys_enter", Program: prog})
+	if err != nil {
+		logger.Fatalf("attach %s to the sys_enter raw tracepoint: %v", programName, err)
+	}
+	defer attached.Close()
 
 	events := coll.Maps["events"]
 	if events == nil {
@@ -97,7 +88,7 @@ func main() {
 	// LOG_EVENTS=1 prints every event the probe sends, not only the ones a rule fires on.
 	// It is for debugging: on a busy host that is a great deal of output.
 	logEvents := os.Getenv("LOG_EVENTS") == "1"
-	logger.Printf("attached %d tracepoints; listening for kernel events", len(tracepoints))
+	logger.Println("attached to sys_enter; listening for kernel events")
 
 	for {
 		record, err := reader.Read()

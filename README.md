@@ -2,22 +2,22 @@
 
 [![CI](https://github.com/Raoof128/eBPF-Cloud-Runtime-Security-Monitor/actions/workflows/ci.yml/badge.svg)](https://github.com/Raoof128/eBPF-Cloud-Runtime-Security-Monitor/actions/workflows/ci.yml)
 
-A small teaching project that shows the parts of a kernel-level runtime monitor and how they connect: eBPF programs on six syscall tracepoints, a Go agent that loads them and applies a few rules, and a React page that lists the alerts.
+A small teaching project that shows the parts of a kernel-level runtime monitor and how they connect: an eBPF program that watches six system calls, a Go agent that loads it and applies a few rules, and a React page that lists the alerts.
 
-**Status.** The probe-to-alert path works and is checked on every CI run: the job compiles the eBPF object, loads the programs into the runner's kernel, attaches them, makes a handful of harmless syscalls and expects the matching alerts. Everything past that is unproven. The rules are single-event heuristics with no measured detection or false-positive rate. Overhead has not been measured. The Helm chart has never been installed on a cluster, and there is no container image to install. This is not a tool to protect anything with.
+**Status.** The probe-to-alert path works and is checked on every CI run: the job compiles the eBPF object, loads it into the runner's kernel, attaches it, makes a handful of harmless syscalls and expects the matching alerts. Everything past that is unproven. The rules are single-event heuristics with no measured detection or false-positive rate. Overhead has not been measured. The Helm chart has never been installed on a cluster, and there is no container image to install. This is not a tool to protect anything with.
 
 ## What it does
 
 ```
  kernel                          user space
 +---------------------+  perf   +----------------------------+  SSE   +-----------+
-| 6 tracepoint progs  | ------> | Go agent                   | -----> | dashboard |
+| sys_enter program   | ------> | Go agent                   | -----> | dashboard |
 | (ebpf/)             | buffer  | decode -> rules -> alerts  | /events| (React)   |
 +---------------------+         +----------------------------+        +-----------+
 ```
 
-1. `ebpf/process_monitor.c` attaches to the entry of `execve`, `execveat`, `connect`, `ptrace`, `memfd_create` and `mmap`. Each program records the process ID, user and group ID, cgroup ID, command name, and the arguments that matter (a path, an IPv4 or IPv6 destination, a ptrace request, mapping flags), and sends that to user space through a perf event array. The programs only read; they do not change or block any syscall. Every call to the first five is reported; `mmap` is the one filtered in the kernel (see the table).
-2. `agent/` loads the compiled object with [cilium/ebpf](https://github.com/cilium/ebpf), attaches the six programs, decodes each event and runs the rules. Alerts are printed as JSON lines and streamed over Server-Sent Events at `/events`.
+1. `ebpf/process_monitor.c` is one program on the raw `sys_enter` tracepoint. It runs at the entry of every system call and returns at once unless the call is `execve`, `execveat`, `connect`, `ptrace`, `memfd_create` or `mmap`. For those it records the process ID, user and group ID, cgroup ID, command name, and the arguments that matter (a path, an IPv4 or IPv6 destination, a ptrace request, mapping flags), and sends that to user space through a perf event array. The program only reads; it does not change or block any syscall. Every call to the first five is reported; `mmap` is the one filtered in the kernel (see the table).
+2. `agent/` loads the compiled object with [cilium/ebpf](https://github.com/cilium/ebpf), attaches the program, decodes each event and runs the rules. Alerts are printed as JSON lines and streamed over Server-Sent Events at `/events`.
 3. `dashboard/` is a single React page that subscribes to `/events` and lists what arrives.
 
 ## Rules
@@ -66,6 +66,7 @@ Note `"container": {"id": "host"}` although this ran inside a container: with cg
 ## Limits
 
 - **`ppid` is always 0.** Finding the parent needs kernel structure offsets (CO-RE), which the probe does not use. There is no process lineage.
+- **x86-64 and arm64 only, native calls only.** The probe reads syscall arguments out of the saved registers, with the offsets and syscall numbers for those two architectures written into it. 32-bit compatibility calls are ignored. CI exercises x86-64; the arm64 values are written from the ABI and have not been run since the probe was restructured.
 - **Only the syscall's arguments are seen**, at entry. A refused or failed call is reported like a successful one, and what the call went on to do is not known.
 - **`suspicious_exec` matches a path string in user space, and that can be walked around.** The agent makes the path absolute (against `/proc/<pid>/cwd`, or the directory descriptor for `execveat`) and cleans it, so `/tmp/../tmp/x`, `//tmp/x` and `./x` run from `/tmp` are all caught. It does not follow symbolic or hard links, so a link from another directory to a file in `/tmp` passes. A relative path from a process that has exited before the agent reads its working directory stays relative and passes too. The robust fix is to resolve the executed file inside the kernel (the `sched_process_exec` tracepoint or the `bprm` hooks); that is not implemented.
 - **Other ways to write into a process are not traced:** `process_vm_writev`, writes to `/proc/<pid>/mem`, and `mprotect`.
@@ -121,7 +122,7 @@ The chart does not expose the alert stream. The agent keeps its default address,
 
 ## Layout
 
-- `ebpf/process_monitor.c`: the six tracepoint programs
+- `ebpf/process_monitor.c`: the probe
 - `agent/`: loader, event decoder, rules, SSE server, and their tests
 - `dashboard/`: React page (Vite)
 - `deploy/helm/`: chart template
