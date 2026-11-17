@@ -1,10 +1,11 @@
 import React, { useEffect, useState } from 'react'
 import './index.css'
 
+// The agent's Server-Sent Events endpoint. Each message is one alert as JSON (see docs/API.md).
 const streamURL = import.meta.env.VITE_EVENTS_URL || 'http://localhost:8090/events'
 
 export default function App() {
-  const [events, setEvents] = useState([])
+  const [alerts, setAlerts] = useState([])
   const [status, setStatus] = useState('disconnected')
 
   useEffect(() => {
@@ -13,10 +14,10 @@ export default function App() {
     es.onerror = () => setStatus('error')
     es.onmessage = (msg) => {
       try {
-        const evt = JSON.parse(msg.data)
-        setEvents((cur) => [evt, ...cur].slice(0, 200))
+        const alert = JSON.parse(msg.data)
+        setAlerts((cur) => [alert, ...cur].slice(0, 200))
       } catch (e) {
-        console.warn('bad event', e)
+        console.warn('bad alert', e)
       }
     }
     return () => es.close()
@@ -26,30 +27,27 @@ export default function App() {
     <div className="page">
       <header>
         <div>
-          <h1>Cloud Runtime Security</h1>
-          <p>Live eBPF-based runtime alerts (educational demo)</p>
+          <h1>Runtime Security Monitor</h1>
+          <p>Alerts from the eBPF agent, newest first (educational demo)</p>
         </div>
-        <span className={`pill ${status}`}>WS: {status}</span>
+        <span className={`pill ${status}`}>Stream: {status}</span>
       </header>
 
       <section className="grid">
         <Card title="Live Alerts" full>
-          <LiveTable events={events} />
+          <LiveTable alerts={alerts} />
         </Card>
-        <Card title="Heatmap" >
-          <Heatmap events={events} />
+        <Card title="Alerts by Container">
+          <Heatmap alerts={alerts} />
         </Card>
-        <Card title="Process Lineage">
-          <Lineage events={events} />
+        <Card title="Alerts by Rule">
+          <RuleCounts alerts={alerts} />
         </Card>
-        <Card title="Reverse Shells">
-          <ReverseShell events={events} />
+        <Card title="Watched-Port Connections">
+          <ReverseShell alerts={alerts} />
         </Card>
-        <Card title="Injection Attempts">
-          <Injection events={events} />
-        </Card>
-        <Card title="CPU/Net Mini-chart">
-          <MiniChart events={events} />
+        <Card title="Injection Primitives">
+          <Injection alerts={alerts} />
         </Card>
       </section>
     </div>
@@ -65,8 +63,20 @@ function Card({ title, children, full }) {
   )
 }
 
-function LiveTable({ events }) {
-  if (events.length === 0) return <p className="muted">Waiting for events…</p>
+function destination(event) {
+  if (!event?.dst_ip) return ''
+  // An IPv6 address needs brackets to keep its colons apart from the port's.
+  const host = event.dst_ip.includes(':') ? `[${event.dst_ip}]` : event.dst_ip
+  return `${host}:${event.dst_port}`
+}
+
+function containerLabel(event) {
+  const id = event?.container?.id
+  return !id || id === 'host' ? 'host' : id.slice(0, 12)
+}
+
+function LiveTable({ alerts }) {
+  if (alerts.length === 0) return <p className="muted">Waiting for alerts…</p>
   return (
     <table className="events">
       <thead>
@@ -74,22 +84,22 @@ function LiveTable({ events }) {
           <th>Time</th>
           <th>Rule</th>
           <th>PID</th>
-          <th>Comm</th>
-          <th>Addr</th>
+          <th>Process</th>
+          <th>Path / destination</th>
           <th>Container</th>
           <th>Reason</th>
         </tr>
       </thead>
       <tbody>
-        {events.map((e, idx) => (
+        {alerts.map((a, idx) => (
           <tr key={idx}>
-            <td>{new Date(e.timestamp).toLocaleTimeString()}</td>
-            <td>{e.rule_id}</td>
-            <td>{e.event?.PID}</td>
-            <td>{trim(e.event?.Comm)}</td>
-            <td>{e.event?.Addr || e.addr || ''}</td>
-            <td>{e.container?.id?.slice(0, 12) || 'host'}</td>
-            <td>{e.reason}</td>
+            <td>{a.event?.timestamp ? new Date(a.event.timestamp).toLocaleTimeString() : ''}</td>
+            <td>{a.rule_id}</td>
+            <td>{a.event?.pid}</td>
+            <td>{a.event?.comm}</td>
+            <td>{destination(a.event) || a.event?.filename || ''}</td>
+            <td>{containerLabel(a.event)}</td>
+            <td>{a.reason}</td>
           </tr>
         ))}
       </tbody>
@@ -97,19 +107,20 @@ function LiveTable({ events }) {
   )
 }
 
-function Heatmap({ events }) {
+// Counts the alerts held in the browser (the newest 200) per container.
+function Heatmap({ alerts }) {
   const buckets = {}
-  events.forEach((e) => {
-    const pod = e.pod?.name || 'host'
-    buckets[pod] = (buckets[pod] || 0) + 1
+  alerts.forEach((a) => {
+    const key = containerLabel(a.event)
+    buckets[key] = (buckets[key] || 0) + 1
   })
   const entries = Object.entries(buckets)
   if (entries.length === 0) return <p className="muted">No data</p>
   return (
     <div className="heatmap">
-      {entries.map(([pod, count]) => (
-        <div key={pod} className="heat" style={{opacity: Math.min(1, 0.3 + count / 10)}}>
-          <span>{pod}</span>
+      {entries.map(([key, count]) => (
+        <div key={key} className="heat" style={{ opacity: Math.min(1, 0.3 + count / 10) }}>
+          <span>{key}</span>
           <strong>{count}</strong>
         </div>
       ))}
@@ -117,62 +128,42 @@ function Heatmap({ events }) {
   )
 }
 
-function Lineage({ events }) {
-  const latest = events[0]
-  if (!latest) return <p className="muted">No lineage yet</p>
-  return (
-    <div className="lineage">
-      <div className="node">PPID {latest.event?.PPID}</div>
-      <div className="edge">→</div>
-      <div className="node">PID {latest.event?.PID} ({trim(latest.event?.Comm)})</div>
-    </div>
-  )
-}
-
-function ReverseShell({ events }) {
-  const shells = events.filter((e) => e.rule_id === 'reverse_shell')
-  if (shells.length === 0) return <p className="muted">No detections</p>
-  return shells.slice(0, 5).map((e, idx) => (
-    <div key={idx} className="pill high">{trim(e.event?.Comm)} → {e.addr || e.event?.Addr}</div>
-  ))
-}
-
-function Injection({ events }) {
-  const inj = events.filter((e) => e.rule_id === 'process_injection')
-  if (inj.length === 0) return <p className="muted">No injections observed</p>
-  return inj.slice(0, 5).map((e, idx) => (
-    <div key={idx} className="pill warning">{trim(e.event?.Comm)} ({e.reason})</div>
-  ))
-}
-
-function MiniChart({ events }) {
-  const cpu = Math.min(100, events.length * 2)
-  const net = Math.min(100, events.filter((e) => e.event?.Addr).length * 5)
+// Counts the alerts held in the browser per rule, as a share of the largest count.
+function RuleCounts({ alerts }) {
+  const counts = {}
+  alerts.forEach((a) => {
+    counts[a.rule_id] = (counts[a.rule_id] || 0) + 1
+  })
+  const entries = Object.entries(counts).sort((x, y) => y[1] - x[1])
+  if (entries.length === 0) return <p className="muted">No data</p>
+  const max = entries[0][1]
   return (
     <div>
-      <Bar label="CPU" value={cpu} />
-      <Bar label="Net" value={net} color="#22c55e" />
+      {entries.map(([rule, count]) => (
+        <div key={rule} className="bar">
+          <span>{rule}</span>
+          <div className="bar-meter">
+            <div className="bar-fill" style={{ width: `${(count / max) * 100}%`, background: '#3b82f6' }} />
+          </div>
+          <span className="muted">{count}</span>
+        </div>
+      ))}
     </div>
   )
 }
 
-function Bar({ label, value, color = '#3b82f6' }) {
-  return (
-    <div className="bar">
-      <span>{label}</span>
-      <div className="bar-meter">
-        <div className="bar-fill" style={{ width: `${value}%`, background: color }} />
-      </div>
-      <span className="muted">{value}%</span>
-    </div>
-  )
+function ReverseShell({ alerts }) {
+  const hits = alerts.filter((a) => a.rule_id === 'reverse_shell')
+  if (hits.length === 0) return <p className="muted">None seen</p>
+  return hits.slice(0, 5).map((a, idx) => (
+    <div key={idx} className="pill high">{a.event?.comm} → {destination(a.event)}</div>
+  ))
 }
 
-function trim(buf) {
-  if (!buf) return ''
-  if (Array.isArray(buf)) {
-    return String.fromCharCode(...buf).replace(/\0/g, '').trim()
-  }
-  if (typeof buf === 'string') return buf
-  return ''
+function Injection({ alerts }) {
+  const hits = alerts.filter((a) => a.rule_id === 'process_injection')
+  if (hits.length === 0) return <p className="muted">None seen</p>
+  return hits.slice(0, 5).map((a, idx) => (
+    <div key={idx} className="pill warning">{a.event?.comm}: {a.reason}</div>
+  ))
 }

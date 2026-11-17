@@ -16,16 +16,18 @@ spec:
       containers:
         - name: agent
           image: {{ .Values.image.agent }}
+          # Privileged gives the container every capability. Loading the probes needs far
+          # less, but a narrower set has not been worked out or tested for this chart.
           securityContext:
             privileged: true
-            capabilities:
-              add: ["BPF", "SYS_ADMIN", "SYS_PTRACE"]
           volumeMounts:
             - name: sys-kernel-debug
               mountPath: /sys/kernel/debug
             - name: cgroup
               mountPath: /sys/fs/cgroup
           env:
+            # LISTEN_ADDR is deliberately not set: the agent keeps its default, 127.0.0.1:8090,
+            # so the alert stream is not reachable from other pods. See values.yaml.
             - name: POD_NAME
               valueFrom:
                 fieldRef:

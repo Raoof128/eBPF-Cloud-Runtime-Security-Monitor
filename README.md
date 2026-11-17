@@ -1,126 +1,139 @@
-# eBPF-Based Cloud Runtime Security Monitor (Educational)
+# eBPF Cloud Runtime Security Monitor (educational)
 
-Synthetic, read-only runtime visibility stack combining kernel eBPF, Go agent rules, a dashboard, and Kubernetes deployment assets. Built to be safe, synthetic, and instructional.
+[![CI](https://github.com/Raoof128/eBPF-Cloud-Runtime-Security-Monitor/actions/workflows/ci.yml/badge.svg)](https://github.com/Raoof128/eBPF-Cloud-Runtime-Security-Monitor/actions/workflows/ci.yml)
 
-## How it works (eBPF overview)
-- eBPF hooks attach to safe syscall tracepoints (`execve`, `connect`, `ptrace`, `memfd_create`, `mmap`).
-- Programs collect lightweight metadata (PID/PPID, comm, filename, dst IP/port, cgroup ID) and emit it via perf buffer.
-- No kernel modules, no data tampering—read-only introspection only.
+A small teaching project that shows the parts of a kernel-level runtime monitor and how they connect: an eBPF program that watches six system calls, a Go agent that loads it and applies a few rules, and a React page that lists the alerts.
 
-## Architecture
+**Status.** The probe-to-alert path works and is checked on every CI run: the job compiles the eBPF object, loads it into the runner's kernel, attaches it, makes a handful of harmless syscalls and expects the matching alerts. Everything past that is unproven. The rules are single-event heuristics with no measured detection or false-positive rate. Overhead has not been measured. The Helm chart has never been installed on a cluster, and there is no container image to install. This is not a tool to protect anything with.
+
+## What it does
+
 ```
-+----------------+      +----------------------+      +------------------+
-| eBPF programs  | -->  | Go agent & rules     | -->  | Dashboard (React)|
-| exec/connect   |      | perf reader + enrich |      | WebSocket feed   |
-| ptrace/mmap    |      | container/K8s meta   |      | live visuals     |
-+----------------+      +----------------------+      +------------------+
-         ^                          |                         |
-         |                          v                         |
-         |                  Synthetic sims                   |
-         |          (reverse shell / injection)              |
-         +---------------------------------------------------+
+ kernel                          user space
++---------------------+  perf   +----------------------------+  SSE   +-----------+
+| sys_enter program   | ------> | Go agent                   | -----> | dashboard |
+| (ebpf/)             | buffer  | decode -> rules -> alerts  | /events| (React)   |
++---------------------+         +----------------------------+        +-----------+
 ```
 
-Additional design notes live in `docs/ARCHITECTURE.md` (includes Mermaid flow).
+1. `ebpf/process_monitor.c` is one program on the raw `sys_enter` tracepoint. It runs at the entry of every system call and returns at once unless the call is `execve`, `execveat`, `connect`, `ptrace`, `memfd_create` or `mmap`. For those it records the process ID, user and group ID, cgroup ID, command name, and the arguments that matter (a path, an IPv4 or IPv6 destination, a ptrace request, mapping flags), and sends that to user space through a perf event array. The program only reads; it does not change or block any syscall. Every call to the first five is reported; `mmap` is the one filtered in the kernel (see the table).
+2. `agent/` loads the compiled object with [cilium/ebpf](https://github.com/cilium/ebpf), attaches the program, decodes each event and runs the rules. Alerts are printed as JSON lines and streamed over Server-Sent Events at `/events`.
+3. `dashboard/` is a single React page that subscribes to `/events` and lists what arrives.
 
-## Repository layout
-- `ebpf/process_monitor.c` — tracepoint programs emitting perf events.
-- `agent/` — Go user space loader, enrichment, and rules engine.
-- `dashboard/` — React UI (Vite) for live alerts/heatmap.
-- `deploy/helm/` — Helm chart (DaemonSet for agent, dashboard Deployment, RBAC, ConfigMap).
-- `scripts/` — Safe simulations (`simulate_reverse_shell.sh`, `simulate_injection.py`).
-- `tests/` — Go unit tests for rule logic.
-- `docs/` — Architecture/design documentation.
-- `docs/API.md` — SSE endpoint and alert schema reference.
+## Rules
 
-## Detection rules (summary)
-- **Reverse Shell**: outbound TCP to {4444, 8081, 9001} _or_ binary in {bash, sh, zsh, python} while user != root.
-- **Process Injection**: ptrace attach, `mmap` with `PROT_EXEC`, or `memfd_create` triggers `injection_attempt` alert.
-- **Suspicious Exec**: binaries from `/tmp`, anonymous memfd, or orphaned non-root children (PPID=1).
+Each rule looks at one event on its own. Nothing is correlated across events, and the lists and risk scores are fixed examples, not threat intelligence.
 
-### Example alert (JSON)
+| Rule | Severity | Fires when | Known noise |
+|---|---|---|---|
+| `reverse_shell` | high | any process calls `connect()` over IPv4 or IPv6 to port 4444, 8081 or 9001 | it is a port match: any service on those ports triggers it, and a reverse shell on another port does not |
+| `shell_network_activity` | medium | `bash`, `sh`, `zsh`, `dash` or a `python*` interpreter itself calls `connect()` to anything else, except over a Unix socket | scripts, and every Python program that uses the network |
+| `process_injection` | high | a `ptrace` request that takes control of a process or changes it (`TRACEME`, `ATTACH`, `SEIZE`, `POKETEXT`, `POKEDATA`, `POKEUSER`, `SETREGS`, `SETFPREGS`, `SETREGSET`, `SETSIGINFO`); an `mmap` that is writable and executable at once; or any `memfd_create` | debuggers, JIT runtimes (Node, Java), and libraries that use memfd |
+| `ptrace_activity` | low | any other `ptrace` request, including ones the agent has no name for | every debugger and `strace` session |
+| `anonymous_exec_mapping` | medium | an `mmap` that is executable and anonymous but not writable | JIT runtimes |
+| `suspicious_exec` | medium | `execve` or `execveat` of a path that, made absolute and cleaned, is under `/tmp`, `/dev/shm` or `/var/tmp`; a path that names a file descriptor (`/dev/fd/N`, `/proc/<pid>/fd/N`); `execveat` on a descriptor with no path (how a memfd-backed binary is started); or a path that mentions `memfd` | build tools and installers that run from `/tmp` |
+
+The one thing dropped before the rules see it is an executable, read-only `mmap` of a file. That is what loading any program or shared library does, on every process on the host; reporting it would bury everything else and overflow the perf buffer, which loses events at random. A mapping made that way and turned writable later with `mprotect` is therefore not seen (`mprotect` is not traced).
+
+Example alert, as the agent printed it in the CI end-to-end job on 17 November 2026 (reformatted; the IDs, host name and time differ from run to run):
+
 ```json
 {
   "rule_id": "reverse_shell",
   "severity": "high",
   "risk_score": 85,
-  "reason": "reverse shell signature: known C2 port",
+  "reason": "outbound connection to a port on the watch list",
+  "recommendation": "check what the process is and whether the destination is expected",
   "event": {
-    "PID": 1234,
-    "PPID": 567,
-    "UID": 1000,
-    "DstPort": 15104,
-    "Comm": "bash",
-    "EventType": "connect"
-  },
-  "container": {"id": "abcd1234", "runtime": "cgroup"},
-  "timestamp": "2025-01-01T00:00:00Z",
-  "addr": "10.0.0.5:4444"
+    "type": "connect",
+    "pid": 2818,
+    "ppid": 0,
+    "uid": 1001,
+    "gid": 1001,
+    "cgroup_id": 6668,
+    "comm": "bash",
+    "family": 2,
+    "dst_ip": "127.0.0.1",
+    "dst_port": 4444,
+    "container": {"id": "host", "name": "", "runtime": ""},
+    "pod": {"name": "runnervmccnms", "namespace": "default", "node": "node-unknown"},
+    "timestamp": "2026-11-17T12:22:26.874574403Z"
+  }
 }
 ```
 
-## Build & run locally (educational)
-1. Compile eBPF (requires clang/LLVM and kernel headers):
-   ```bash
-   cd ebpf
-   clang -O2 -g -target bpf -c process_monitor.c -o process_monitor.bpf.o
-   ```
-2. Run the Go agent (needs root/BPF permissions):
-   ```bash
-   cd agent
-   go run ./
-   ```
-   It loads `../ebpf/process_monitor.bpf.o`, reads perf events, enriches with cgroup/K8s hints, and prints JSON alerts.
-3. Dashboard (optional demo, consumes SSE at `/events`):
-   ```bash
-   cd dashboard
-   npm install
-   npm run dev -- --host
-   ```
-   Set `VITE_EVENTS_URL` if the SSE endpoint is different (default `http://localhost:8090/events`).
+## Limits
 
-## Kubernetes (Helm) quickstart
+- **`ppid` is always 0.** Finding the parent needs kernel structure offsets (CO-RE), which the probe does not use. There is no process lineage.
+- **x86-64 and arm64 only, native calls only.** The probe reads syscall arguments out of the saved registers, with the offsets and syscall numbers for those two architectures written into it. 32-bit compatibility calls are ignored. CI exercises x86-64; the arm64 values are written from the ABI and have not been run since the probe was restructured.
+- **Only the syscall's arguments are seen**, at entry. A refused or failed call is reported like a successful one, and what the call went on to do is not known.
+- **`suspicious_exec` matches a path string in user space, and that can be walked around.** The agent makes the path absolute (against `/proc/<pid>/cwd`, or the directory descriptor for `execveat`) and cleans it, so `/tmp/../tmp/x`, `//tmp/x` and `./x` run from `/tmp` are all caught. It does not follow symbolic or hard links, so a link from another directory to a file in `/tmp` passes. A relative path from a process that has exited before the agent reads its working directory stays relative and passes too. The robust fix is to resolve the executed file inside the kernel (the `sched_process_exec` tracepoint or the `bprm` hooks); that is not implemented.
+- **Other ways to write into a process are not traced:** `process_vm_writev`, writes to `/proc/<pid>/mem`, and `mprotect`.
+- **Connections:** only `connect()` is traced, so accepted connections and `sendto()` on an unconnected socket are not seen. The protocol is not known (a UDP `connect()` looks like a TCP one). Families other than IPv4 and IPv6 are reported with the family number and no address.
+- **Events can be lost.** If the agent reads slower than the kernel writes, the perf buffer drops events and the agent logs how many.
+- **Container attribution is a guess.** The container ID is the first long hex string in `/proc/<pid>/cgroup`; a process that has already exited, or one seen from inside its own cgroup namespace, shows as `host`. The `pod` block is the agent's own pod (from environment variables), the same for every event. The agent does not talk to the Kubernetes API.
+- **The alert stream.** Alerts carry process names, paths and connection targets. The agent listens on `127.0.0.1:8090` and serves `/events` without authentication there. It refuses to start on any other address unless `EVENTS_TOKEN` is set, and then `/events` requires `Authorization: Bearer <token>`. The bundled dashboard uses the browser's `EventSource`, which cannot send that header, so it only works against the loopback address.
+- **Easy to evade.** Beyond the above: a port not on the list, or a binary in any directory that is not listed.
+
+## Build and run
+
+Needs Linux with syscall tracepoints, root, clang, the libbpf headers, and Go 1.22 or later (1.23 was used here). On Debian or Ubuntu: `sudo apt-get install clang libbpf-dev`. The kernel it has actually run on is given under Tests.
+
+```bash
+make bpf agent                       # ebpf/process_monitor.bpf.o and bin/ecrsm-agent
+sudo BPF_OBJECT=ebpf/process_monitor.bpf.o ./bin/ecrsm-agent
 ```
-helm install runtime ./deploy/helm \
-  --set image.agent="ghcr.io/you/runtime-agent:tag" \
-  --set image.dashboard="ghcr.io/you/runtime-dashboard:tag"
+
+In another terminal, trigger an alert:
+
+```bash
+bash scripts/simulate_reverse_shell.sh   # bash connects to 127.0.0.1:4444 (refused; nothing listens)
+python3 scripts/simulate_injection.py    # ptrace attach to itself (the kernel refuses)
+python3 scripts/simulate_fexecve.py      # /bin/true copied into a memfd and run from it
+python3 scripts/simulate_ipv6_connect.py # the same connection attempt over IPv6
+cp /bin/true /tmp/demo && /tmp/demo      # exec from /tmp
 ```
-- DaemonSet runs the agent with BPF privileges (hostPID + BPF/SYS_ADMIN caps).
-- Dashboard served via ClusterIP service on port 8080.
-- ConfigMap `runtime-security-monitor-rules` carries the educational rule set.
 
-## Synthetic attack simulations
-- Reverse shell: `bash scripts/simulate_reverse_shell.sh` (local-only nc, safe to stop via trap).
-- Injection: `python3 scripts/simulate_injection.py` (self-ptrace attach/detach for a single event).
+Dashboard (optional):
 
-## Why kernel-level visibility?
-- Syscall-layer telemetry sees short-lived or fileless activity before user space logs exist.
-- eBPF provides low-overhead, programmable filters without kernel modules.
-- Container/cgroup IDs allow per-pod attribution even with shared nodes.
+```bash
+cd dashboard
+npm ci
+npm run dev        # http://localhost:4173, reads http://localhost:8090/events
+```
 
-## Testing
-- Run Go unit tests for rules:
-  ```bash
-  go test ./tests
-  ```
-- Lint/format:
-  - Go: `gofmt -w agent/*.go`
-  - JS/React: `npm run build` (ensures Vite build passes)
+Set `CORS_ORIGIN` on the agent if the page is served from another origin. The page only works against an agent on the loopback address (see Limits). The agent's settings are in [docs/API.md](docs/API.md).
 
-## Governance & security
-- Contribution guidelines: `CONTRIBUTING.md`
-- Code of conduct: `CODE_OF_CONDUCT.md`
-- Security policy: `SECURITY.md`
-- License: MIT (`LICENSE`)
+## Tests
 
-## Dashboard snapshot (concept)
-- Live alerts stream (rule, PID, container, reason)
-- Pod heatmap indicating alert density
-- Process lineage (PPID → PID)
-- Reverse shell and injection highlight panels
-- CPU/network mini-bars for quick anomaly hints
+```bash
+make test    # go vet and unit tests: rules, event decoding, the SSE server (runs on any OS)
+make e2e     # Linux and root: loads the probes and checks the alerts end to end
+```
 
-## Safety notes
-- Only safe tracepoints; no writes to kernel memory.
-- Metadata only (no payloads, no secrets).
-- Simulations are local and self-contained; adapt targets as needed in isolated labs.
+CI runs both, builds the dashboard, and renders the Helm chart. The end-to-end job is the evidence for the status line above. It makes eight checks: an exec from `/tmp`, a relative exec from `/tmp`, a ptrace attach, `memfd_create`, an `execveat` of a memfd, and connections over IPv4, IPv6 and IPv4-mapped IPv6, each of which must produce its alert with the fields decoded.
+
+Where it has run: GitHub's `ubuntu-latest` runner, x86-64, kernel 7.0.0-1019-azure, eight of eight. Nowhere else for the current probe. An earlier version of the probe (one program per syscall tracepoint) also ran in a container on an arm64 7.0 kernel, but that version turned out to miss most execs on the CI runner and was replaced; the arm64 register offsets in the current probe have not been exercised.
+
+`LOG_EVENTS=1` makes the agent print every event it receives, not only the ones a rule fires on, which is how the missing execs were found.
+
+## Kubernetes
+
+`deploy/helm/` is a chart template: a privileged DaemonSet for the agent and a Deployment for the dashboard. It renders (`helm template` runs in CI) and that is all that has been checked. It has never been installed, there is no Dockerfile or published image for it to pull, and the values file points at placeholder image names.
+
+The chart does not expose the alert stream. The agent keeps its default address, `127.0.0.1:8090` inside its own pod, and the chart creates no Service or NetworkPolicy for it; CI fails if the rendered chart sets `LISTEN_ADDR`. Alerts are on the agent's standard output, so in a cluster they would be read with `kubectl logs`, and the dashboard Deployment has nothing to connect to. Exposing the stream would take `LISTEN_ADDR` plus `EVENTS_TOKEN` from a Secret and a NetworkPolicy admitting only the client; none of that is in the chart, and the agent will not listen beyond loopback without the token. Treat the chart as a sketch of what a deployment would need, including the fact that it asks for a fully privileged container.
+
+## Layout
+
+- `ebpf/process_monitor.c`: the probe
+- `agent/`: loader, event decoder, rules, SSE server, and their tests
+- `dashboard/`: React page (Vite)
+- `deploy/helm/`: chart template
+- `scripts/`: the demo triggers and the end-to-end check
+- `docs/`: [architecture notes](docs/ARCHITECTURE.md) and the [alert format](docs/API.md)
+
+## Safety
+
+Run it on a machine you own. The agent needs root and sees the command names, paths and connection targets of every process on the host, which can include sensitive strings. The demo scripts make refused local connections, one refused ptrace request, one `/tmp` exec and one in-memory run of `/bin/true`; they do not open a shell or touch another process.
+
+MIT licence. See [SECURITY.md](SECURITY.md) to report a problem.

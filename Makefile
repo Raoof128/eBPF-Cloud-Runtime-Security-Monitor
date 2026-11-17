@@ -1,26 +1,37 @@
-.PHONY: all bpf agent dashboard test lint fmt clean
+.PHONY: all bpf agent dashboard test fmt lint e2e clean
 
-BPF_OBJ=ebpf/process_monitor.bpf.o
+BPF_OBJ := ebpf/process_monitor.bpf.o
+AGENT   := bin/ecrsm-agent
+# <asm/types.h> lives in the architecture's include directory on Debian and Ubuntu.
+ARCH_INCLUDE := /usr/include/$(shell uname -m)-linux-gnu
+# The probe reads syscall arguments out of saved registers, which is per architecture.
+BPF_ARCH := $(if $(filter x86_64,$(shell uname -m)),x86,$(if $(filter aarch64 arm64,$(shell uname -m)),arm64,unsupported))
 
-all: bpf agent dashboard
+all: bpf agent
 
+# Needs clang and the libbpf headers (Debian/Ubuntu: clang libbpf-dev).
 bpf:
-	cd ebpf && clang -O2 -g -target bpf -c process_monitor.c -o process_monitor.bpf.o
+	clang -O2 -g -Wall -target bpf -D__TARGET_ARCH_$(BPF_ARCH) -I$(ARCH_INCLUDE) -c ebpf/process_monitor.c -o $(BPF_OBJ)
 
 agent:
-	cd agent && go build ./...
+	cd agent && go build -o ../$(AGENT) .
 
 dashboard:
-	cd dashboard && npm install && npm run build
+	cd dashboard && npm ci && npm run build
+
+test:
+	cd agent && go vet ./... && go test -race ./...
 
 fmt:
 	gofmt -w agent/*.go
 
-lint: fmt
+lint:
+	test -z "$$(gofmt -l agent)"
 	cd dashboard && npm run lint
 
-test:
-	cd agent && go test ./...
+# Loads the probes into the running kernel, so it needs Linux and root (it calls sudo).
+e2e:
+	bash scripts/e2e_smoke.sh
 
 clean:
-	rm -f $(BPF_OBJ)
+	rm -rf $(BPF_OBJ) bin

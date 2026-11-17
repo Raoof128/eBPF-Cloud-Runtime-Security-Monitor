@@ -1,0 +1,4 @@
+bin/
+*.bpf.o
+dashboard/node_modules/
+dashboard/dist/

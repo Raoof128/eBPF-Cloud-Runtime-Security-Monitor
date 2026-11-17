@@ -1,28 +1,22 @@
 #!/usr/bin/env python3
-"""Synthetic ptrace attach demo for triggering injection rule.
-This script is safe: it attaches to its own PID, pokes a register, and detaches.
+"""Calls ptrace(PTRACE_ATTACH) on this script's own process.
+
+A process cannot attach to itself, so the kernel refuses and nothing is traced. The probe
+sits on syscall entry, so it still sees the request, which is all the demo needs.
 """
 
-import os
 import ctypes
 import ctypes.util
-import time
+import os
+
+PTRACE_ATTACH = 16
 
 libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
-PTRACE_ATTACH = 16
-PTRACE_DETACH = 17
-
 pid = os.getpid()
-print(f"[demo] self-ptrace attach to pid {pid}")
+print(f"[demo] ptrace(PTRACE_ATTACH) on own pid {pid}")
 
-ret = libc.ptrace(PTRACE_ATTACH, pid, None, None)
-if ret != 0:
-    err = ctypes.get_errno()
-    print(f"ptrace attach failed: {os.strerror(err)}")
+if libc.ptrace(PTRACE_ATTACH, pid, None, None) != 0:
+    print(f"[demo] refused as expected: {os.strerror(ctypes.get_errno())}")
 else:
-    # give kernel time to emit event
-    time.sleep(0.5)
-    print("detaching")
-    libc.ptrace(PTRACE_DETACH, pid, None, None)
-
-print("done")
+    print("[demo] unexpectedly allowed")
+print("[demo] done")
