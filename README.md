@@ -35,7 +35,7 @@ Each rule looks at one event on its own. Nothing is correlated across events, an
 
 The one thing dropped before the rules see it is an executable, read-only `mmap` of a file. That is what loading any program or shared library does, on every process on the host; reporting it would bury everything else and overflow the perf buffer, which loses events at random. A mapping made that way and turned writable later with `mprotect` is therefore not seen (`mprotect` is not traced).
 
-Example alert, as the agent printed it during an end-to-end run in a container on 17 November 2026 (reformatted; the IDs, host name and time differ from run to run):
+Example alert, as the agent printed it in the CI end-to-end job on 17 November 2026 (reformatted; the IDs, host name and time differ from run to run):
 
 ```json
 {
@@ -46,22 +46,21 @@ Example alert, as the agent printed it during an end-to-end run in a container o
   "recommendation": "check what the process is and whether the destination is expected",
   "event": {
     "type": "connect",
-    "pid": 31867,
+    "pid": 2818,
     "ppid": 0,
-    "uid": 0,
-    "gid": 0,
-    "cgroup_id": 1327,
+    "uid": 1001,
+    "gid": 1001,
+    "cgroup_id": 6668,
     "comm": "bash",
+    "family": 2,
     "dst_ip": "127.0.0.1",
     "dst_port": 4444,
     "container": {"id": "host", "name": "", "runtime": ""},
-    "pod": {"name": "ecrsm-demo", "namespace": "default", "node": "node-unknown"},
-    "timestamp": "2026-11-17T11:59:10.242266923Z"
+    "pod": {"name": "runnervmccnms", "namespace": "default", "node": "node-unknown"},
+    "timestamp": "2026-11-17T12:22:26.874574403Z"
   }
 }
 ```
-
-Note `"container": {"id": "host"}` although this ran inside a container: with cgroup v2 a process sees its own cgroup as `/`, so the hex-string guess finds nothing. See Limits.
 
 ## Limits
 
@@ -78,7 +77,7 @@ Note `"container": {"id": "host"}` although this ran inside a container: with cg
 
 ## Build and run
 
-Needs Linux with syscall tracepoints, root, clang, the libbpf headers, and Go 1.22 or later (1.23 was used here). On Debian or Ubuntu: `sudo apt-get install clang libbpf-dev`. Kernels it has actually run on are listed under Tests.
+Needs Linux with syscall tracepoints, root, clang, the libbpf headers, and Go 1.22 or later (1.23 was used here). On Debian or Ubuntu: `sudo apt-get install clang libbpf-dev`. The kernel it has actually run on is given under Tests.
 
 ```bash
 make bpf agent                       # ebpf/process_monitor.bpf.o and bin/ecrsm-agent
@@ -112,7 +111,11 @@ make test    # go vet and unit tests: rules, event decoding, the SSE server (run
 make e2e     # Linux and root: loads the probes and checks the alerts end to end
 ```
 
-CI runs both, builds the dashboard, and renders the Helm chart. The end-to-end job is the evidence for the status line above; it has run on GitHub's `ubuntu-latest` runner (x86-64) and, by hand, on a 7.0 kernel on arm64.
+CI runs both, builds the dashboard, and renders the Helm chart. The end-to-end job is the evidence for the status line above. It makes eight checks: an exec from `/tmp`, a relative exec from `/tmp`, a ptrace attach, `memfd_create`, an `execveat` of a memfd, and connections over IPv4, IPv6 and IPv4-mapped IPv6, each of which must produce its alert with the fields decoded.
+
+Where it has run: GitHub's `ubuntu-latest` runner, x86-64, kernel 7.0.0-1019-azure, eight of eight. Nowhere else for the current probe. An earlier version of the probe (one program per syscall tracepoint) also ran in a container on an arm64 7.0 kernel, but that version turned out to miss most execs on the CI runner and was replaced; the arm64 register offsets in the current probe have not been exercised.
+
+`LOG_EVENTS=1` makes the agent print every event it receives, not only the ones a rule fires on, which is how the missing execs were found.
 
 ## Kubernetes
 

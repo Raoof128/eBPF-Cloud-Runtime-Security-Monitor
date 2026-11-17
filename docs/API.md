@@ -52,5 +52,6 @@ On the default loopback address neither endpoint has authentication. The agent r
 | `BPF_OBJECT` | `../ebpf/process_monitor.bpf.o` | compiled probe object to load |
 | `LISTEN_ADDR` | `127.0.0.1:8090` | address for `/events` and `/healthz`. Anything but a loopback address needs `EVENTS_TOKEN` |
 | `EVENTS_TOKEN` | unset | if set, the bearer token `/events` requires |
+| `LOG_EVENTS` | unset | `1` prints every event the probe sends, with the CPU it came from. For debugging; it is a lot of output on a busy host |
 | `CORS_ORIGIN` | `http://localhost:4173` | the one browser origin allowed to read `/events`; the Vite dev server's address |
 | `POD_NAME`, `POD_NAMESPACE`, `NODE_NAME` | host name, `default`, `node-unknown` | copied into every event's `pod` block |
