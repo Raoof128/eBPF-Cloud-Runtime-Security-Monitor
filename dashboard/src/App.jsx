@@ -65,7 +65,9 @@ function Card({ title, children, full }) {
 
 function destination(event) {
   if (!event?.dst_ip) return ''
-  return `${event.dst_ip}:${event.dst_port}`
+  // An IPv6 address needs brackets to keep its colons apart from the port's.
+  const host = event.dst_ip.includes(':') ? `[${event.dst_ip}]` : event.dst_ip
+  return `${host}:${event.dst_port}`
 }
 
 function containerLabel(event) {

@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"syscall"
 	"time"
 
@@ -23,6 +24,7 @@ import (
 // attaches to.
 var tracepoints = map[string]string{
 	"handle_execve":  "sys_enter_execve",
+	"handle_execveat": "sys_enter_execveat",
 	"handle_connect": "sys_enter_connect",
 	"handle_ptrace":  "sys_enter_ptrace",
 	"handle_memfd":   "sys_enter_memfd_create",
@@ -36,6 +38,10 @@ func main() {
 
 	objectPath := envOr("BPF_OBJECT", "../ebpf/process_monitor.bpf.o")
 	listenAddr := envOr("LISTEN_ADDR", "127.0.0.1:8090")
+	eventsToken := os.Getenv("EVENTS_TOKEN")
+	if err := CheckListenConfig(listenAddr, eventsToken); err != nil {
+		logger.Fatalf("refusing to start: %v", err)
+	}
 
 	// Kernels before 5.11 charge BPF memory against RLIMIT_MEMLOCK.
 	if err := rlimit.RemoveMemlock(); err != nil {
@@ -75,7 +81,7 @@ func main() {
 	defer reader.Close()
 
 	alertCh := make(chan Alert, 1024)
-	srv := NewAlertServer(listenAddr, envOr("CORS_ORIGIN", "http://localhost:4173"), logger)
+	srv := NewAlertServer(listenAddr, envOr("CORS_ORIGIN", "http://localhost:4173"), eventsToken, logger)
 	go func() {
 		if err := srv.ListenAndServe(ctx, alertCh); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			logger.Printf("http server stopped: %v", err)
@@ -88,7 +94,6 @@ func main() {
 		reader.Close()
 	}()
 
-	self := uint32(os.Getpid())
 	logger.Printf("attached %d tracepoints; listening for kernel events", len(tracepoints))
 
 	for {
@@ -111,8 +116,8 @@ func main() {
 			logger.Printf("skip event: %v", err)
 			continue
 		}
-		if evt.PID == self {
-			continue // the agent's own syscalls
+		if evt.Type == EventExec || evt.Type == EventExecveat {
+			evt.ResolvedPath = resolveExecPath(evt.Filename, evt.PID, evt.DirFD, processDir)
 		}
 		evt.Container = LookupContainerMetadata(int(evt.PID))
 		evt.Pod = LookupPodMeta()
@@ -132,6 +137,25 @@ func main() {
 			}
 		}
 	}
+}
+
+// processDir finds the directory a relative exec path is relative to: the process's working
+// directory for AT_FDCWD, otherwise whatever its descriptor dirfd is open on. Both come from
+// /proc, so it fails for a process that has already exited, which a short-lived one may have
+// by the time its event is read.
+func processDir(pid uint32, dirfd int32) (string, bool) {
+	link := "/proc/" + strconv.FormatUint(uint64(pid), 10) + "/cwd"
+	if dirfd != atFdCwd {
+		if dirfd < 0 {
+			return "", false
+		}
+		link = "/proc/" + strconv.FormatUint(uint64(pid), 10) + "/fd/" + strconv.Itoa(int(dirfd))
+	}
+	dir, err := os.Readlink(link)
+	if err != nil {
+		return "", false
+	}
+	return dir, true
 }
 
 // envOr returns the environment value for key, or def if it is unset or empty.

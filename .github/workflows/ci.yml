@@ -20,7 +20,9 @@ jobs:
           go-version: "1.23"
           cache-dependency-path: agent/go.sum
       - name: gofmt
-        run: test -z "$(gofmt -l agent)"
+        run: |
+          gofmt -d agent
+          test -z "$(gofmt -l agent)"
       - name: go.mod and go.sum are tidy
         working-directory: agent
         run: |
@@ -45,8 +47,9 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y clang libbpf-dev
-      # Loads the five programs into the runner's kernel, attaches them, makes three harmless
-      # syscalls and fails unless the three matching alerts come out of the agent.
+      # Compiles the eBPF object, loads the six programs into the runner's kernel, attaches
+      # them, makes a handful of harmless syscalls and fails unless the matching alerts come
+      # out of the agent.
       - name: Smoke test
         run: make e2e
 
@@ -78,4 +81,11 @@ jobs:
       - name: Lint and render
         run: |
           helm lint deploy/helm
-          helm template demo deploy/helm > /dev/null
+          helm template demo deploy/helm > rendered.yaml
+      # The alert stream must stay on loopback: the chart may not set a listen address.
+      - name: Chart does not expose the alert stream
+        run: |
+          if grep -n "LISTEN_ADDR" rendered.yaml | grep -v "^[0-9]*: *#"; then
+            echo "::error::the chart sets LISTEN_ADDR"
+            exit 1
+          fi

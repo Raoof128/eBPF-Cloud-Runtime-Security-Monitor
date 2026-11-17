@@ -1,12 +1,19 @@
 // eBPF process and network monitor (educational, read-only).
 //
-// Five tracepoint programs on syscall entry: execve, connect, ptrace, memfd_create and mmap.
-// Each fills one event_t and sends it to user space through a perf event array.
+// Six tracepoint programs on syscall entry: execve, execveat, connect, ptrace, memfd_create
+// and mmap. Each fills one event_t and sends it to user space through a perf event array.
 //
 // The programs only read. They never change a syscall's arguments or its result.
+//
+// What is decided here and what is left to user space: the probe reports every execve,
+// execveat, connect, ptrace and memfd_create call it sees, and the agent's rules decide what
+// matters. The one filter is on mmap (see handle_mmap), because reporting every executable
+// mapping would mean one event per shared-library load on the whole host, and a perf buffer
+// that full loses the events that do matter.
 
 #include <linux/bpf.h>
 #include <linux/in.h>
+#include <linux/in6.h>
 #include <linux/mman.h>
 #include <linux/socket.h>
 #include <bpf/bpf_helpers.h>
@@ -14,16 +21,13 @@
 #ifndef AF_INET
 #define AF_INET 2
 #endif
+#ifndef AF_INET6
+#define AF_INET6 10
+#endif
 
 #define TASK_COMM_LEN 16
 #define FILE_NAME_LEN 256
 #define EVENT_TYPE_LEN 16
-
-// ptrace requests that take control of, or write into, another process.
-#define PTRACE_POKETEXT_REQ 4
-#define PTRACE_POKEDATA_REQ 5
-#define PTRACE_ATTACH_REQ 16
-#define PTRACE_SEIZE_REQ 0x4206
 
 // Layout of the context a syscalls:sys_enter_* tracepoint hands to a program. Declared here
 // so the file builds without vmlinux.h.
@@ -44,16 +48,21 @@ struct event_t {
     __u32 uid;
     __u32 gid;
     __u64 cgroup_id;
-    __u32 dst_ip;    // IPv4 address, network byte order (connect only)
-    __u16 dst_port;  // network byte order (connect only)
-    __u8 proto;
+    __u32 dst_ip;    // connect, AF_INET: address in network byte order
+    __u16 dst_port;  // connect, AF_INET and AF_INET6: port in network byte order
+    __u8 proto;      // always 0: connect() does not say, and the socket is not looked up
     __u8 pad;
+    __u32 family;       // connect: address family as passed (0 if it could not be read)
+    __s32 dirfd;        // execveat: directory file descriptor argument
+    __u64 arg0;         // ptrace: request. mmap: prot. execveat: flags
+    __u64 arg1;         // mmap: flags
+    __u8 dst_ip6[16];   // connect, AF_INET6: address
     char comm[TASK_COMM_LEN];
     char filename[FILE_NAME_LEN];
     char event_type[EVENT_TYPE_LEN];
 };
 
-_Static_assert(sizeof(struct event_t) == 320, "event_t layout changed: update agent/event.go");
+_Static_assert(sizeof(struct event_t) == 360, "event_t layout changed: update agent/event.go");
 
 struct {
     __uint(type, BPF_MAP_TYPE_PERF_EVENT_ARRAY);
@@ -92,45 +101,65 @@ int handle_execve(struct sys_enter_ctx *ctx) {
     return 0;
 }
 
-SEC("tracepoint/syscalls/sys_enter_connect")
-int handle_connect(struct sys_enter_ctx *ctx) {
-    const struct sockaddr *uservaddr = (const struct sockaddr *)ctx->args[1];
-    int addrlen = (int)ctx->args[2];
-
-    // Only IPv4 is decoded. Unix sockets, IPv6 and anything else are not reported.
-    if (!uservaddr || addrlen < (int)sizeof(struct sockaddr_in))
-        return 0;
-
-    struct sockaddr_in sa = {};
-    if (bpf_probe_read_user(&sa, sizeof(sa), uservaddr) != 0)
-        return 0;
-    if (sa.sin_family != AF_INET)
-        return 0;
-
+// execveat(dirfd, pathname, argv, envp, flags). With an empty pathname and AT_EMPTY_PATH it
+// runs the file that dirfd refers to, which is how fexecve() starts a memfd-backed binary.
+SEC("tracepoint/syscalls/sys_enter_execveat")
+int handle_execveat(struct sys_enter_ctx *ctx) {
     struct event_t evt = {};
     fill_task_context(&evt);
-    evt.dst_ip = sa.sin_addr.s_addr;
-    evt.dst_port = sa.sin_port;
-    // connect() does not say which protocol the socket uses, and the probe does not look the
-    // socket up, so this is left at 0 (unknown). A UDP connect() is reported like a TCP one.
-    evt.proto = 0;
+
+    evt.dirfd = (__s32)ctx->args[0];
+    const char *filename = (const char *)ctx->args[1];
+    if (filename)
+        bpf_probe_read_user_str(evt.filename, FILE_NAME_LEN, filename);
+    evt.arg0 = ctx->args[4];
+
+    SUBMIT(ctx, evt, "execveat");
+    return 0;
+}
+
+// Every connect() is reported, whatever the address family. The destination is decoded for
+// IPv4 and IPv6; for anything else (a Unix socket, netlink) only the family is carried.
+SEC("tracepoint/syscalls/sys_enter_connect")
+int handle_connect(struct sys_enter_ctx *ctx) {
+    struct event_t evt = {};
+    fill_task_context(&evt);
+
+    const void *uaddr = (const void *)ctx->args[1];
+    int addrlen = (int)ctx->args[2];
+    __u16 family = 0;
+
+    if (uaddr && addrlen >= (int)sizeof(family) &&
+        bpf_probe_read_user(&family, sizeof(family), uaddr) == 0) {
+        evt.family = family;
+
+        if (family == AF_INET && addrlen >= (int)sizeof(struct sockaddr_in)) {
+            struct sockaddr_in sa = {};
+            if (bpf_probe_read_user(&sa, sizeof(sa), uaddr) == 0) {
+                evt.dst_ip = sa.sin_addr.s_addr;
+                evt.dst_port = sa.sin_port;
+            }
+        } else if (family == AF_INET6 && addrlen >= (int)sizeof(struct sockaddr_in6)) {
+            struct sockaddr_in6 sa6 = {};
+            if (bpf_probe_read_user(&sa6, sizeof(sa6), uaddr) == 0) {
+                evt.dst_port = sa6.sin6_port;
+                __builtin_memcpy(evt.dst_ip6, &sa6.sin6_addr, sizeof(evt.dst_ip6));
+            }
+        }
+    }
 
     SUBMIT(ctx, evt, "connect");
     return 0;
 }
 
+// Every ptrace() is reported with its request number. Which requests matter is the agent's
+// decision, not the probe's.
 SEC("tracepoint/syscalls/sys_enter_ptrace")
 int handle_ptrace(struct sys_enter_ctx *ctx) {
-    long request = (long)ctx->args[0];
-
-    // Most ptrace calls are a debugger talking to a process it already controls. Report only
-    // the requests that take control of a process or write into its memory.
-    if (request != PTRACE_ATTACH_REQ && request != PTRACE_SEIZE_REQ &&
-        request != PTRACE_POKETEXT_REQ && request != PTRACE_POKEDATA_REQ)
-        return 0;
-
     struct event_t evt = {};
     fill_task_context(&evt);
+    evt.arg0 = ctx->args[0];
+
     SUBMIT(ctx, evt, "ptrace");
     return 0;
 }
@@ -148,19 +177,28 @@ int handle_memfd(struct sys_enter_ctx *ctx) {
     return 0;
 }
 
+// mmap(addr, length, prot, flags, fd, offset).
+//
+// Reported: an executable mapping that is also writable, or that is anonymous (not backed by
+// a file). Not reported: an executable, read-only mapping of a file, which is what loading
+// any program or shared library does. That one case is filtered here and not in user space
+// because of its volume; see the note at the top of the file.
 SEC("tracepoint/syscalls/sys_enter_mmap")
 int handle_mmap(struct sys_enter_ctx *ctx) {
     unsigned long prot = ctx->args[2];
+    unsigned long flags = ctx->args[3];
 
-    // Every shared library is mapped executable, so PROT_EXEC alone says nothing. A mapping
-    // that is writable and executable at once is rarer (JIT compilers do it, and so does
-    // injected code).
-    if ((prot & (PROT_WRITE | PROT_EXEC)) != (PROT_WRITE | PROT_EXEC))
+    if (!(prot & PROT_EXEC))
+        return 0;
+    if (!(prot & PROT_WRITE) && !(flags & MAP_ANONYMOUS))
         return 0;
 
     struct event_t evt = {};
     fill_task_context(&evt);
-    SUBMIT(ctx, evt, "mmap_wx");
+    evt.arg0 = prot;
+    evt.arg1 = flags;
+
+    SUBMIT(ctx, evt, "mmap_exec");
     return 0;
 }
 

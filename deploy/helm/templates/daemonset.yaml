@@ -26,9 +26,8 @@ spec:
             - name: cgroup
               mountPath: /sys/fs/cgroup
           env:
-            # Inside a pod the stream has to be reachable from other pods.
-            - name: LISTEN_ADDR
-              value: ":8090"
+            # LISTEN_ADDR is deliberately not set: the agent keeps its default, 127.0.0.1:8090,
+            # so the alert stream is not reachable from other pods. See values.yaml.
             - name: POD_NAME
               valueFrom:
                 fieldRef:
