@@ -23,12 +23,12 @@ import (
 // tracepoints maps each program in ebpf/process_monitor.c to the syscall tracepoint it
 // attaches to.
 var tracepoints = map[string]string{
-	"handle_execve":  "sys_enter_execve",
+	"handle_execve":   "sys_enter_execve",
 	"handle_execveat": "sys_enter_execveat",
-	"handle_connect": "sys_enter_connect",
-	"handle_ptrace":  "sys_enter_ptrace",
-	"handle_memfd":   "sys_enter_memfd_create",
-	"handle_mmap":    "sys_enter_mmap",
+	"handle_connect":  "sys_enter_connect",
+	"handle_ptrace":   "sys_enter_ptrace",
+	"handle_memfd":    "sys_enter_memfd_create",
+	"handle_mmap":     "sys_enter_mmap",
 }
 
 func main() {
@@ -94,6 +94,9 @@ func main() {
 		reader.Close()
 	}()
 
+	// LOG_EVENTS=1 prints every event the probe sends, not only the ones a rule fires on.
+	// It is for debugging: on a busy host that is a great deal of output.
+	logEvents := os.Getenv("LOG_EVENTS") == "1"
 	logger.Printf("attached %d tracepoints; listening for kernel events", len(tracepoints))
 
 	for {
@@ -122,6 +125,12 @@ func main() {
 		evt.Container = LookupContainerMetadata(int(evt.PID))
 		evt.Pod = LookupPodMeta()
 		evt.Timestamp = time.Now().UTC()
+
+		if logEvents {
+			if payload, err := json.Marshal(evt); err == nil {
+				logger.Println("event " + string(payload))
+			}
+		}
 
 		for _, alert := range EvaluateRules(evt) {
 			payload, err := json.Marshal(alert)

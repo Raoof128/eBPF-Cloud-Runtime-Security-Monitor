@@ -21,7 +21,7 @@ if ! $SUDO test -d /sys/kernel/tracing/events && ! $SUDO test -d /sys/kernel/deb
     $SUDO mount -t tracefs nodev /sys/kernel/tracing
 fi
 
-$SUDO env BPF_OBJECT=ebpf/process_monitor.bpf.o LISTEN_ADDR=127.0.0.1:8090 \
+$SUDO env BPF_OBJECT=ebpf/process_monitor.bpf.o LISTEN_ADDR=127.0.0.1:8090 LOG_EVENTS=1 \
     ./bin/ecrsm-agent >"$LOG" 2>&1 &
 
 stop_agent() { $SUDO pkill -INT -x ecrsm-agent 2>/dev/null || true; }
@@ -100,9 +100,12 @@ echo "alerts by rule:"
 grep -o '"rule_id":"[a-z_]*"' "$LOG" | sort | uniq -c || true
 echo "one alert as printed (reverse_shell):"
 grep -m1 '"rule_id":"reverse_shell"' "$LOG" | sed 's/^[^{]*//' || true
+echo "events by type:"
+grep ' event {' "$LOG" | grep -o '"type":"[a-z_]*"' | sort | uniq -c || true
 if [ "$status" -ne 0 ]; then
-    echo "--- agent output ---"
-    cat "$LOG"
+    echo "--- agent output: alerts, and events from the smoke processes ---"
+    grep -v ' event {' "$LOG" || true
+    grep ' event {' "$LOG" | grep -E 'ecrsm-smoke|"type":"(memfd|execveat|ptrace)"|"comm":"python' | tail -60 || true
 fi
 rm -f "$LOG"
 exit "$status"
