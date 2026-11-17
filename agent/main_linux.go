@@ -128,7 +128,7 @@ func main() {
 
 		if logEvents {
 			if payload, err := json.Marshal(evt); err == nil {
-				logger.Println("event " + string(payload))
+				logger.Printf("event cpu=%d %s", record.CPU, payload)
 			}
 		}
 
